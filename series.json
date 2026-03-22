@@ -1,0 +1,20 @@
+{
+  "series": [
+    {
+      "ticker": "KXNBAMENTION",
+      "label": "NBA Mentions"
+    },
+    {
+      "ticker": "KXNCAABMENTION",
+      "label": "College Basketball Mentions"
+    },
+    {
+      "ticker": "KXFIGHTMENTION",
+      "label": "Fight Mentions"
+    },
+    {
+      "ticker": "KXWBCMENTION",
+      "label": "WBC Mentions"
+    }
+  ]
+}

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Interactive CLI tool for Kalshi prediction markets."""
 
+import json
 import os
 import re
 import sys
@@ -319,35 +320,30 @@ class KalshiAPI:
         response.raise_for_status()
         return response.json()
 
-    def get_mention_series(self) -> list:
-        """Get all series tickers in the Mentions category (public endpoint)."""
+    def get_mention_series_map(self) -> dict:
+        """Get mention series as {ticker: {title, tags}} map."""
         url = f"{API_HOST}{API_PATH_PREFIX}/series"
         response = self.session.get(url, params={"category": "Mentions"})
         response.raise_for_status()
         data = response.json()
-        return [s.get("ticker") for s in data.get("series", []) if s.get("ticker")]
+        result = {}
+        for s in data.get("series", []):
+            ticker = s.get("ticker")
+            if ticker:
+                result[ticker] = {
+                    "title": s.get("title", ticker),
+                    "tags": s.get("tags") or [],
+                }
+        return result
 
-    def get_all_mention_events(self) -> list:
-        """Get all open mention events using category-based lookup with brute-force fallback."""
-        # Step 1: Try category-based approach (fast)
-        try:
-            series_tickers = self.get_mention_series()
-        except Exception:
-            series_tickers = []
+    def get_all_mention_events(self) -> tuple:
+        """Get all open mention events by scanning open events.
 
-        if series_tickers:
-            # Step 2: Fetch open events for each mention series
-            all_events = []
-            for ticker in series_tickers:
-                try:
-                    data = self.get_events_by_series(ticker, status="open")
-                    all_events.extend(data.get("events", []))
-                except Exception:
-                    continue
-            if all_events:
-                return all_events
+        Returns (events_list, series_map) where series_map has tag info.
+        """
+        series_map = self.get_mention_series_map()
+        series_set = set(series_map.keys())
 
-        # Fallback: brute-force scan all open events
         url = f"{API_HOST}{API_PATH_PREFIX}/events"
         all_events = []
         cursor = None
@@ -360,12 +356,12 @@ class KalshiAPI:
             data = response.json()
             events = data.get("events", [])
             for e in events:
-                if "mention" in e.get("event_ticker", "").lower():
+                if e.get("series_ticker", "") in series_set:
                     all_events.append(e)
             cursor = data.get("cursor")
             if not cursor or not events:
                 break
-        return all_events
+        return all_events, series_map
 
     def get_orders(self, status: str = None, limit: int = 100, cursor: str = None) -> dict:
         """Get orders, optionally filtered by status (resting, canceled, executed)."""
@@ -1525,6 +1521,19 @@ def run_account_menu(api: KalshiAPI):
             run_download_menu(api)
 
 
+def load_saved_series() -> list:
+    """Load saved series tickers from series.json config file."""
+    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "series.json")
+    if not os.path.exists(config_path):
+        return []
+    try:
+        with open(config_path, "r") as f:
+            data = json.load(f)
+        return data.get("series", [])
+    except (json.JSONDecodeError, IOError):
+        return []
+
+
 def parse_kalshi_url(url: str) -> dict:
     """Parse a Kalshi URL to extract series and event tickers.
 
@@ -1784,23 +1793,41 @@ def run_market_menu(api: KalshiAPI):
     """Run the market details submenu."""
     print("\n=== MARKET DETAILS ===\n")
 
-    # Ask for URL
-    url = questionary.text(
-        "Enter a Kalshi market URL (or 'back' to return):",
-        validate=lambda x: len(x) > 0,
+    # Build entry method choices
+    entry_choices = [{"name": "Enter a Kalshi market URL", "value": "url"}]
+    saved_series = load_saved_series()
+    for s in saved_series:
+        label = s.get("label", s["ticker"])
+        entry_choices.append({"name": label, "value": s["ticker"]})
+    entry_choices.append({"name": "Back", "value": "back"})
+
+    selection = questionary.select(
+        "Select a series or enter a URL:",
+        choices=entry_choices,
+        use_arrow_keys=True,
     ).ask()
 
-    if url is None or url.lower() == "back":
+    if selection is None or selection == "back":
         return
 
-    # Parse URL
-    parsed = parse_kalshi_url(url)
-    if not parsed:
-        print("\nCouldn't parse URL. Expected format:")
-        print("  https://kalshi.com/markets/{series}/{slug}/{event}\n")
-        return
+    if selection == "url":
+        url = questionary.text(
+            "Enter a Kalshi market URL (or 'back' to return):",
+            validate=lambda x: len(x) > 0,
+        ).ask()
 
-    series_ticker = parsed["series_ticker"]
+        if url is None or url.lower() == "back":
+            return
+
+        parsed = parse_kalshi_url(url)
+        if not parsed:
+            print("\nCouldn't parse URL. Expected format:")
+            print("  https://kalshi.com/markets/{series}/{slug}/{event}\n")
+            return
+
+        series_ticker = parsed["series_ticker"]
+    else:
+        series_ticker = selection
 
     while True:
         try:
@@ -1818,6 +1845,18 @@ def run_market_menu(api: KalshiAPI):
                 print("No events found for this series.\n")
                 return
 
+            # Fetch resting buy orders and build set of event tickers with buys
+            try:
+                resting_orders = api.get_all_orders("resting")
+                buy_event_tickers = set()
+                for order in resting_orders:
+                    if order.get("action", "").lower() == "buy":
+                        market_ticker = order.get("ticker", "")
+                        event_t = market_ticker.rsplit("-", 1)[0]
+                        buy_event_tickers.add(event_t)
+            except Exception:
+                buy_event_tickers = set()
+
             # Build choices from event titles with sub_title (date)
             choices = []
             for e in events:
@@ -1825,11 +1864,14 @@ def run_market_menu(api: KalshiAPI):
                 title = e.get("title", ticker)
                 sub_title = e.get("sub_title", "")
 
+                # Indicator for buy orders
+                has_buys = "[x]" if ticker in buy_event_tickers else "[ ]"
+
                 # Build display string with date if available
                 if sub_title:
-                    display = f"{title} ({sub_title})"
+                    display = f"{has_buys} {title} ({sub_title})"
                 else:
-                    display = title
+                    display = f"{has_buys} {title}"
 
                 choices.append({"name": display, "value": ticker})
             choices.append({"name": "Back", "value": "back"})
@@ -1867,13 +1909,13 @@ def run_market_menu(api: KalshiAPI):
 
 
 def run_mention_markets_menu(api: KalshiAPI):
-    """Browse active mention markets grouped by series."""
+    """Browse active mention markets grouped by category and series."""
     while True:
         print("\n=== MENTION MARKETS ===\n")
-        print("Fetching mention events...")
+        print("Fetching mention events (scanning open events)...")
 
         try:
-            events = api.get_all_mention_events()
+            events, series_map = api.get_all_mention_events()
         except requests.exceptions.HTTPError as e:
             print(f"\nAPI Error: {e}")
             if e.response:
@@ -1893,65 +1935,89 @@ def run_mention_markets_menu(api: KalshiAPI):
                 sys.exit(0)
             continue
 
-        # Group by series_ticker
+        # Fetch resting buy orders and build set of event tickers with buys
+        try:
+            resting_orders = api.get_all_orders("resting")
+            buy_event_tickers = set()
+            for order in resting_orders:
+                if order.get("action", "").lower() == "buy":
+                    market_ticker = order.get("ticker", "")
+                    event_t = market_ticker.rsplit("-", 1)[0]
+                    buy_event_tickers.add(event_t)
+        except Exception:
+            buy_event_tickers = set()
+
+        # Group by series_ticker, enriched with tag from series_map
         grouped = {}
         for e in events:
             series = e.get("series_ticker", "UNKNOWN")
             if series not in grouped:
-                grouped[series] = []
-            grouped[series].append(e)
+                info = series_map.get(series, {})
+                tags = info.get("tags", [])
+                tag = tags[0] if tags else "Other"
+                grouped[series] = {"events": [], "tag": tag}
+            grouped[series]["events"].append(e)
 
-        # Display summary table
+        # Collect unique tags for category filter
+        all_tags = sorted(set(g["tag"] for g in grouped.values()))
+
+        # Display summary table grouped by category
         rows = []
-        for series, evts in grouped.items():
-            title = evts[0].get("title", series)
-            if len(title) > 50:
-                title = title[:47] + "..."
-            rows.append([series, title, len(evts)])
+        for series, g in grouped.items():
+            title = g["events"][0].get("title", series)
+            if len(title) > 45:
+                title = title[:42] + "..."
+            rows.append([g["tag"], title, len(g["events"])])
 
+        rows.sort(key=lambda r: (r[0], r[1]))
         print(f"\nFound {len(events)} mention event(s) in {len(grouped)} series.\n")
-        print(tabulate(rows, headers=["Series Ticker", "Title", "# Events"], tablefmt="simple"))
+        print(tabulate(rows, headers=["Category", "Title", "# Events"], tablefmt="simple"))
         print()
 
-        # Build series selection menu
-        choices = []
-        for series, evts in grouped.items():
-            title = evts[0].get("title", series)
-            if len(title) > 50:
-                title = title[:47] + "..."
-            choices.append({"name": f"{series} - {title} ({len(evts)} events)", "value": series})
-        choices.append({"name": "Back", "value": "back"})
-        choices.append({"name": "Refresh", "value": "refresh"})
-        choices.append({"name": "Exit", "value": "exit"})
+        # Category filter then series selection
+        filter_choices = [{"name": "All markets", "value": "all"}]
+        for tag in all_tags:
+            count = sum(len(g["events"]) for g in grouped.values() if g["tag"] == tag)
+            filter_choices.append({"name": f"{tag} ({count} events)", "value": tag})
+        filter_choices.append({"name": "Back", "value": "back"})
+        filter_choices.append({"name": "Refresh", "value": "refresh"})
+        filter_choices.append({"name": "Exit", "value": "exit"})
 
-        selected_series = questionary.select(
-            "Select a series to browse events:",
-            choices=choices,
+        selected_filter = questionary.select(
+            "Filter by category:",
+            choices=filter_choices,
             use_arrow_keys=True,
         ).ask()
 
-        if selected_series is None or selected_series == "back":
+        if selected_filter is None or selected_filter == "back":
             return
-        if selected_series == "exit":
+        if selected_filter == "exit":
             print("Goodbye!")
             sys.exit(0)
-        if selected_series == "refresh":
+        if selected_filter == "refresh":
             continue
 
-        # Show events for selected series
-        series_events = grouped[selected_series]
-        while True:
-            print(f"\n=== EVENTS FOR {selected_series} ===\n")
+        # Filter series by selected category
+        if selected_filter == "all":
+            filtered = grouped
+        else:
+            filtered = {s: g for s, g in grouped.items() if g["tag"] == selected_filter}
 
+        # Flatten to event list for selection
+        all_filtered_events = []
+        for g in filtered.values():
+            all_filtered_events.extend(g["events"])
+
+        while True:
             event_choices = []
-            for e in series_events:
+            for e in all_filtered_events:
                 ticker = e.get("event_ticker", "")
                 title = e.get("title", ticker)
                 sub_title = e.get("sub_title", "")
-                display = f"{title} ({sub_title})" if sub_title else title
+                has_buys = "[x]" if ticker in buy_event_tickers else "[ ]"
+                display = f"{has_buys} {title} ({sub_title})" if sub_title else f"{has_buys} {title}"
                 event_choices.append({"name": display, "value": ticker})
             event_choices.append({"name": "Back", "value": "back"})
-            event_choices.append({"name": "Refresh", "value": "refresh"})
             event_choices.append({"name": "Exit", "value": "exit"})
 
             selected_event = questionary.select(
@@ -1965,8 +2031,6 @@ def run_mention_markets_menu(api: KalshiAPI):
             if selected_event == "exit":
                 print("Goodbye!")
                 sys.exit(0)
-            if selected_event == "refresh":
-                continue
 
             print_event_markets(api, selected_event)
 
